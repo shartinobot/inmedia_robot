@@ -87,7 +87,7 @@ class Config:
     REFERRAL_BONUS = int(os.getenv("REFERRAL_BONUS", 1))
     
     # کپشن ثابت برای همه فایل‌ها
-    CUSTOM_CAPTION = "📥 ربات دانلود از اینستاگرام : @inmedia_robot"
+    CUSTOM_CAPTION = os.getenv("CUSTOM_CAPTION", "📥 ربات دانلود از اینستاگرام : @inmedia_robot")
 
 # ========== راه‌اندازی ==========
 bot = Bot(token=Config.BOT_TOKEN)
