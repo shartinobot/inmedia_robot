@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ربات دانلودر اینستاگرام - نسخه نهایی با فوروارد کردن پیام‌ها
+ربات دانلودر اینستاگرام - نسخه نهایی با asyncio.create_task
 """
 
 import os
 import json
 import logging
 import time
+import asyncio
 from datetime import datetime
 from threading import Thread
 from flask import Flask, jsonify
@@ -51,6 +52,7 @@ def run_web_server():
 
 # ======================== دیتابیس در حافظه ========================
 users = {}
+pending_requests = {}  # 🔥 دیکشنری برای تایم‌اوت
 
 def get_user(user_id):
     uid = str(user_id)
@@ -203,6 +205,19 @@ async def buy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
+# ======================== تابع تایم‌اوت ========================
+async def timeout_task(msg_id: int, user_id: int, bot):
+    """بعد از ۲ دقیقه تایم‌اوت"""
+    await asyncio.sleep(120)
+    
+    if msg_id in pending_requests:
+        del pending_requests[msg_id]
+        try:
+            await bot.send_message(user_id, "⏰ زمان دانلود تمام شد. دوباره تلاش کنید.")
+            await bot.delete_message(GROUP_ID, msg_id)
+        except:
+            pass
+
 # ======================== هندلر لینک با فوروارد ========================
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -236,43 +251,27 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # 3️⃣ فوروارد کردن پیام کاربر به گروه (به جای send_message)
+    # 3️⃣ ارسال به گروه (با کلمه کلیدی)
     wait_msg = await message.reply_text("⏳ در حال پردازش...")
     try:
-        # 🔥 قسمت اصلی: فوروارد کردن پیام کاربر به گروه
-        group_msg = await context.bot.forward_message(
-            chat_id=GROUP_ID,
-            from_chat_id=user_id,
-            message_id=message.message_id
+        # 🔥 ارسال با کلمه کلیدی /dl
+        group_msg = await context.bot.send_message(
+            GROUP_ID,
+            f"/dl {link}"
         )
         
         # ذخیره برای matching
-        context.user_data[f"pending_{group_msg.message_id}"] = user_id
+        pending_requests[group_msg.message_id] = {
+            "user_id": user_id,
+            "time": time.time()
+        }
         
-        # تایمر ۲ دقیقه
-        context.job_queue.run_once(
-            timeout_job,
-            120,
-            data={"msg_id": group_msg.message_id, "user_id": user_id}
-        )
+        # 🔥 تایمر با asyncio.create_task
+        asyncio.create_task(timeout_task(group_msg.message_id, user_id, context.bot))
+        
         await wait_msg.delete()
     except Exception as e:
         await wait_msg.edit_text(f"❌ خطا: {str(e)[:50]}")
-
-# ======================== تایم‌اوت ========================
-async def timeout_job(context: ContextTypes.DEFAULT_TYPE):
-    data = context.job.data
-    msg_id = data["msg_id"]
-    user_id = data["user_id"]
-    
-    key = f"pending_{msg_id}"
-    if key in context.user_data:
-        del context.user_data[key]
-        await context.bot.send_message(user_id, "⏰ زمان دانلود تمام شد. دوباره تلاش کنید.")
-        try:
-            await context.bot.delete_message(GROUP_ID, msg_id)
-        except:
-            pass
 
 # ======================== گوش دادن به گروه ========================
 async def handle_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -285,20 +284,18 @@ async def handle_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not message.reply_to_message:
         return
     
-    # پیدا کردن message_id اصلی (که فوروارد شده)
-    original_msg_id = message.reply_to_message.message_id
-    key = f"pending_{original_msg_id}"
+    msg_id = message.reply_to_message.message_id
     
-    if key not in context.user_data:
+    if msg_id not in pending_requests:
         return
     
-    user_id = context.user_data[key]
-    del context.user_data[key]
+    user_id = pending_requests[msg_id]["user_id"]
+    del pending_requests[msg_id]
     
     # خطا؟
     if message.text and ("error" in message.text.lower() or "❌" in message.text):
         await context.bot.send_message(user_id, f"❌ خطا: {message.text}")
-        await cleanup(context, original_msg_id, message.message_id)
+        await cleanup(context, msg_id, message.message_id)
         return
     
     # ثبت دانلود
@@ -320,12 +317,12 @@ async def handle_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_animation(user_id, message.animation.file_id, caption=CUSTOM_CAPTION)
         else:
             await context.bot.send_message(user_id, "⚠️ فرمت فایل پشتیبانی نمی‌شود")
-            await cleanup(context, original_msg_id, message.message_id)
+            await cleanup(context, msg_id, message.message_id)
             return
     except Exception as e:
         await context.bot.send_message(user_id, f"❌ خطا: {str(e)[:50]}")
     
-    await cleanup(context, original_msg_id, message.message_id)
+    await cleanup(context, msg_id, message.message_id)
 
 # ======================== پاک‌سازی ========================
 async def cleanup(context, link_id, reply_id):
