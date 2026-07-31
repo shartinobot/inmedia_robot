@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ربات دانلودر اینستاگرام - نسخه بدون دیتابیس (همه چیز با ری‌استارت پاک میشه)
+ربات دانلودر اینستاگرام - نسخه نهایی با فوروارد کردن پیام‌ها
 """
 
 import os
@@ -49,11 +49,9 @@ def run_web_server():
     port = int(os.environ.get("PORT", 10000))
     flask_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
-# ======================== دیتابیس در حافظه (با ری‌استارت پاک میشه) ========================
-# ❌ دیگه فایل JSON ذخیره نمیشه!
-users = {}  # ← فقط تو حافظه
+# ======================== دیتابیس در حافظه ========================
+users = {}
 
-# ======================== توابع کاربر ========================
 def get_user(user_id):
     uid = str(user_id)
     if uid not in users:
@@ -205,10 +203,11 @@ async def buy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
-# ======================== هندلر لینک ========================
+# ======================== هندلر لینک با فوروارد ========================
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    link = update.message.text
+    message = update.message
+    link = message.text
     
     # 1️⃣ عضویت اجباری
     for ch in SPONSOR_CHANNELS:
@@ -216,7 +215,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             member = await context.bot.get_chat_member(ch["id"], user_id)
             if member.status in ["left", "kicked"]:
                 keyboard = [[InlineKeyboardButton(f"📢 عضویت در {ch['name']}", url=f"https://t.me/{ch['id'].replace('-100', '')}")]]
-                await update.message.reply_text(
+                await message.reply_text(
                     f"🚨 لطفاً در {ch['name']} عضو شوید",
                     reply_markup=InlineKeyboardMarkup(keyboard)
                 )
@@ -231,16 +230,23 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("🎁 دعوت از دوستان", callback_data="referral")],
             [InlineKeyboardButton("♾️ خرید اشتراک", callback_data="buy")]
         ]
-        await update.message.reply_text(
+        await message.reply_text(
             f"{msg}\n\nیکی از گزینه‌ها رو انتخاب کن:",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
         return
     
-    # 3️⃣ ارسال به گروه
-    wait_msg = await update.message.reply_text("⏳ در حال پردازش...")
+    # 3️⃣ فوروارد کردن پیام کاربر به گروه (به جای send_message)
+    wait_msg = await message.reply_text("⏳ در حال پردازش...")
     try:
-        group_msg = await context.bot.send_message(GROUP_ID, f"📥 {link}")
+        # 🔥 قسمت اصلی: فوروارد کردن پیام کاربر به گروه
+        group_msg = await context.bot.forward_message(
+            chat_id=GROUP_ID,
+            from_chat_id=user_id,
+            message_id=message.message_id
+        )
+        
+        # ذخیره برای matching
         context.user_data[f"pending_{group_msg.message_id}"] = user_id
         
         # تایمر ۲ دقیقه
@@ -279,8 +285,9 @@ async def handle_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not message.reply_to_message:
         return
     
-    msg_id = message.reply_to_message.message_id
-    key = f"pending_{msg_id}"
+    # پیدا کردن message_id اصلی (که فوروارد شده)
+    original_msg_id = message.reply_to_message.message_id
+    key = f"pending_{original_msg_id}"
     
     if key not in context.user_data:
         return
@@ -291,7 +298,7 @@ async def handle_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # خطا؟
     if message.text and ("error" in message.text.lower() or "❌" in message.text):
         await context.bot.send_message(user_id, f"❌ خطا: {message.text}")
-        await cleanup(context, msg_id, message.message_id)
+        await cleanup(context, original_msg_id, message.message_id)
         return
     
     # ثبت دانلود
@@ -313,12 +320,12 @@ async def handle_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_animation(user_id, message.animation.file_id, caption=CUSTOM_CAPTION)
         else:
             await context.bot.send_message(user_id, "⚠️ فرمت فایل پشتیبانی نمی‌شود")
-            await cleanup(context, msg_id, message.message_id)
+            await cleanup(context, original_msg_id, message.message_id)
             return
     except Exception as e:
         await context.bot.send_message(user_id, f"❌ خطا: {str(e)[:50]}")
     
-    await cleanup(context, msg_id, message.message_id)
+    await cleanup(context, original_msg_id, message.message_id)
 
 # ======================== پاک‌سازی ========================
 async def cleanup(context, link_id, reply_id):
@@ -372,7 +379,6 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(text)
 
-# ======================== ریست کردن دیتا (دستور ادمین) ========================
 async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id != ADMIN_ID:
@@ -381,7 +387,7 @@ async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     global users
     users = {}
-    await update.message.reply_text("🧹 **همه داده‌ها پاک شد!**\nهمه کاربران از اول شروع می‌کنند.")
+    await update.message.reply_text("🧹 **همه داده‌ها پاک شد!**")
 
 # ======================== اصلی ========================
 def main():
@@ -399,7 +405,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("premium", premium_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
-    app.add_handler(CommandHandler("reset", reset_cmd))  # ← جدید
+    app.add_handler(CommandHandler("reset", reset_cmd))
     
     # کالبک‌ها
     app.add_handler(CallbackQueryHandler(main_menu, pattern="^main_menu$"))
