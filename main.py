@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ربات دانلودر اینستاگرام - نسخه نهایی با asyncio.create_task
+ربات دانلودر اینستاگرام - نسخه کامل با Telethon
 """
 
 import os
 import json
-import logging
 import time
 import asyncio
-from datetime import datetime
+import logging
 from threading import Thread
+from datetime import datetime
 from flask import Flask, jsonify
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -18,6 +18,10 @@ from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, filters, ContextTypes
 )
+
+from telethon import TelegramClient, events
+from telethon.sessions import StringSession
+from telethon.errors import FloodWaitError
 
 # ======================== تنظیمات ========================
 TOKEN = os.environ.get("BOT_TOKEN")
@@ -30,12 +34,17 @@ PREMIUM_PRICE = os.environ.get("PREMIUM_PRICE", "۲۰۰,۰۰۰ تومان")
 SUPPORT_ID = os.environ.get("SUPPORT_ID", "admin")
 CUSTOM_CAPTION = os.environ.get("CUSTOM_CAPTION", "📥 ربات دانلود از اینستاگرام : @inmedia_robot")
 
+# Telethon Settings
+API_ID = int(os.environ.get("API_ID", 0))
+API_HASH = os.environ.get("API_HASH")
+SESSION_STRING = os.environ.get("SESSION_STRING")
+
 try:
     SPONSOR_CHANNELS = json.loads(os.environ.get("SPONSOR_CHANNELS", "[]"))
 except:
     SPONSOR_CHANNELS = []
 
-# ======================== وب‌سرور Flask ========================
+# ======================== Flask Web Server ========================
 flask_app = Flask(__name__)
 
 @flask_app.route("/")
@@ -50,9 +59,16 @@ def run_web_server():
     port = int(os.environ.get("PORT", 10000))
     flask_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
-# ======================== دیتابیس در حافظه ========================
+# ======================== Logging ========================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# ======================== Database (Memory) ========================
 users = {}
-pending_requests = {}  # 🔥 دیکشنری برای تایم‌اوت
+pending_requests = {}
 
 def get_user(user_id):
     uid = str(user_id)
@@ -94,34 +110,120 @@ def increment_download(user_id):
     if user["first_time"] == 0:
         user["first_time"] = int(time.time())
 
-# ======================== منوی اصلی ========================
-async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    user = get_user(user_id)
+# ======================== Telethon Client ========================
+class TelethonService:
+    def __init__(self):
+        self.client = None
+        self._running = False
+        self.bot = None
     
-    keyboard = [
-        [InlineKeyboardButton("📊 وضعیت من", callback_data="status")],
-        [InlineKeyboardButton("🎁 دعوت از دوستان", callback_data="referral")],
-        [InlineKeyboardButton("♾️ خرید اشتراک", callback_data="buy")],
-    ]
+    async def start(self):
+        if not API_ID or not API_HASH or not SESSION_STRING:
+            logger.error("❌ Telethon credentials not configured!")
+            return False
+        
+        try:
+            self.client = TelegramClient(
+                StringSession(SESSION_STRING),
+                API_ID,
+                API_HASH
+            )
+            
+            await self.client.connect()
+            
+            if not await self.client.is_user_authorized():
+                logger.error("❌ Telethon client not authorized!")
+                return False
+            
+            me = await self.client.get_me()
+            logger.info(f"✅ Telethon started as: @{me.username}")
+            
+            self._running = True
+            
+            # Start listening to group
+            @self.client.on(events.NewMessage(chats=GROUP_ID))
+            async def handle_message(event):
+                message = event.message
+                
+                # Only process messages from downloader bot
+                if message.from_id and message.from_id.user_id == DOWNLOADER_ID:
+                    logger.info(f"📩 Received message from downloader bot")
+                    
+                    if not message.reply_to:
+                        return
+                    
+                    msg_id = message.reply_to.reply_to_msg_id
+                    
+                    if msg_id not in pending_requests:
+                        return
+                    
+                    user_id = pending_requests[msg_id]
+                    del pending_requests[msg_id]
+                    
+                    # Check if it's an error message
+                    if message.text and ("error" in message.text.lower() or "❌" in message.text):
+                        await self.bot.send_message(user_id, f"❌ خطا: {message.text}")
+                        await self.cleanup(msg_id, message.id)
+                        return
+                    
+                    # Send media to user
+                    if message.media:
+                        try:
+                            await self.bot.copy_message(
+                                chat_id=user_id,
+                                from_chat_id=GROUP_ID,
+                                message_id=message.id,
+                                caption=CUSTOM_CAPTION
+                            )
+                            increment_download(user_id)
+                            await self.cleanup(msg_id, message.id)
+                        except Exception as e:
+                            logger.error(f"❌ Error sending media: {e}")
+                            await self.bot.send_message(user_id, f"❌ خطا: {str(e)[:50]}")
+                            await self.cleanup(msg_id, message.id)
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Telethon error: {e}")
+            return False
     
-    text = f"🎯 **ربات دانلودر اینستاگرام**\n\n"
-    text += f"👤 کاربر: @{user.get('username') or 'کاربر'}\n"
-    text += f"💰 {'👑 پریمیوم' if user['premium'] else '🆓 رایگان'}\n"
-    text += f"📥 دانلود امروز: {user['downloads']}\n"
-    text += f"✅ باقی‌مانده: {FREE_LIMIT + user['bonus'] - user['downloads']}\n\n"
-    text += f"📥 لینک خود را ارسال کنید تا دانلود کنم."
+    async def send_link(self, link: str, user_id: int) -> bool:
+        try:
+            message = await self.client.send_message(
+                GROUP_ID,
+                f"📥 {link}"
+            )
+            pending_requests[message.id] = user_id
+            logger.info(f"✅ Link sent to group (msg_id: {message.id})")
+            return True
+        except FloodWaitError as e:
+            logger.warning(f"⏳ FloodWait: {e.seconds}s")
+            await asyncio.sleep(e.seconds)
+            return await self.send_link(link, user_id)
+        except Exception as e:
+            logger.error(f"❌ Failed to send link: {e}")
+            return False
     
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    async def cleanup(self, link_id: int, downloader_id: int):
+        try:
+            await self.client.delete_messages(GROUP_ID, [link_id, downloader_id])
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to delete: {e}")
+    
+    async def stop(self):
+        self._running = False
+        if self.client:
+            await self.client.disconnect()
+            logger.info("🛑 Telethon stopped")
 
-# ======================== استارت ========================
+telethon = TelethonService()
+
+# ======================== Bot Handlers ========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    username = update.effective_user.username
     user = get_user(user_id)
-    user["username"] = username
+    user["username"] = update.effective_user.username
     
     keyboard = [
         [InlineKeyboardButton("📊 وضعیت من", callback_data="status")],
@@ -129,17 +231,61 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("♾️ خرید اشتراک", callback_data="buy")],
     ]
     
-    text = f"🎯 **به ربات دانلودر خوش آمدید!**\n\n"
-    text += f"📥 لینک خود را ارسال کنید تا دانلود کنم.\n\n"
-    text += f"📊 سهمیه رایگان: {FREE_LIMIT} دانلود/روز\n"
-    text += f"💰 قیمت اشتراک: {PREMIUM_PRICE}\n\n"
-    text += f"🔹 پشتیبانی از:\n"
-    text += f"• اینستاگرام\n• یوتیوب\n• تیک‌تاک\n• فیسبوک\n• توییتر/X"
+    text = (
+        f"🎯 **به ربات دانلودر خوش آمدید!**\n\n"
+        f"📥 لینک خود را ارسال کنید تا دانلود کنم.\n\n"
+        f"📊 سهمیه رایگان: {FREE_LIMIT} دانلود/روز\n"
+        f"💰 قیمت اشتراک: {PREMIUM_PRICE}\n\n"
+        f"🔹 پشتیبانی از:\n"
+        f"• اینستاگرام\n• یوتیوب\n• تیک‌تاک\n• فیسبوک\n• توییتر/X"
+    )
     
     await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
-# ======================== وضعیت ========================
-async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    link = update.message.text
+    
+    # 1️⃣ Check sponsor channels
+    for channel in SPONSOR_CHANNELS:
+        try:
+            member = await context.bot.get_chat_member(channel["id"], user_id)
+            if member.status in ["left", "kicked"]:
+                keyboard = [[InlineKeyboardButton(f"📢 عضویت در {channel['name']}", url=f"https://t.me/{channel['id'].replace('-100', '')}")]]
+                await update.message.reply_text(
+                    f"🚨 لطفاً در {channel['name']} عضو شوید",
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+                return
+        except:
+            pass
+    
+    # 2️⃣ Check download limit
+    can, msg, _ = can_download(user_id)
+    if not can:
+        keyboard = [
+            [InlineKeyboardButton("🎁 دعوت از دوستان", callback_data="referral")],
+            [InlineKeyboardButton("♾️ خرید اشتراک", callback_data="buy")]
+        ]
+        await update.message.reply_text(
+            f"{msg}\n\nیکی از گزینه‌ها رو انتخاب کن:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
+    
+    # 3️⃣ Send link via Telethon
+    wait_msg = await update.message.reply_text("⏳ **در حال دانلود با بالاترین کیفیت...**")
+    
+    try:
+        success = await telethon.send_link(link, user_id)
+        if success:
+            await wait_msg.edit_text("⏳ **در حال دانلود با بالاترین کیفیت...**\n✅ لینک ارسال شد. منتظر پاسخ باشید...")
+        else:
+            await wait_msg.edit_text("❌ خطا در ارسال به گروه. دوباره تلاش کنید.")
+    except Exception as e:
+        await wait_msg.edit_text(f"❌ خطا: {str(e)[:50]}")
+
+async def status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
@@ -148,37 +294,56 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     limit = FREE_LIMIT + user["bonus"]
     remaining = limit - user["downloads"]
     
-    text = f"📊 **وضعیت شما**\n"
-    text += f"━━━━━━━━━━━━━━━\n"
-    text += f"👤 {query.from_user.first_name}\n"
-    text += f"📌 {'👑 پریمیوم' if user['premium'] else '🆓 رایگان'}\n"
-    text += f"📥 دانلود امروز: {user['downloads']}\n"
-    text += f"✅ باقی‌مانده: {max(0, remaining)}\n"
-    text += f"🎁 هدیه دعوت: {user['bonus']}\n"
-    text += f"👥 دعوت موفق: {user['referrals']}\n"
-    text += f"━━━━━━━━━━━━━━━\n"
-    text += f"🔗 لینک دعوت شما:\n"
-    text += f"https://t.me/{context.bot.username}?start=ref_{user_id}"
+    text = (
+        f"📊 **وضعیت شما**\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"👤 {query.from_user.first_name}\n"
+        f"📌 {'👑 پریمیوم' if user['premium'] else '🆓 رایگان'}\n"
+        f"📥 دانلود امروز: {user['downloads']}\n"
+        f"✅ باقی‌مانده: {max(0, remaining)}\n"
+        f"🎁 هدیه دعوت: {user['bonus']}\n"
+        f"👥 دعوت موفق: {user['referrals']}"
+    )
+    
+    keyboard = [[InlineKeyboardButton("🔙 منوی اصلی", callback_data="main_menu")]]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    user = get_user(user_id)
     
     keyboard = [
-        [InlineKeyboardButton("🔙 منوی اصلی", callback_data="main_menu")]
+        [InlineKeyboardButton("📊 وضعیت من", callback_data="status")],
+        [InlineKeyboardButton("🎁 دعوت از دوستان", callback_data="referral")],
+        [InlineKeyboardButton("♾️ خرید اشتراک", callback_data="buy")],
     ]
+    
+    text = (
+        f"🎯 **ربات دانلودر اینستاگرام**\n\n"
+        f"👤 کاربر: @{user.get('username') or 'کاربر'}\n"
+        f"💰 {'👑 پریمیوم' if user['premium'] else '🆓 رایگان'}\n"
+        f"📥 دانلود امروز: {user['downloads']}\n"
+        f"✅ باقی‌مانده: {FREE_LIMIT + user['bonus'] - user['downloads']}\n\n"
+        f"📥 لینک خود را ارسال کنید تا دانلود کنم."
+    )
     
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
-# ======================== دعوت ========================
-async def referral_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def referral_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
     
-    bot_username = context.bot.username
+    bot_username = (await context.bot.get_me()).username
     link = f"https://t.me/{bot_username}?start=ref_{user_id}"
     
-    text = f"🎁 **لینک دعوت شما**\n\n"
-    text += f"🔗 {link}\n\n"
-    text += f"📌 هر دعوت موفق = ۱ دانلود هدیه\n\n"
-    text += f"📋 روی لینک بالا کلیک کنید تا کپی شود"
+    text = (
+        f"🎁 **لینک دعوت شما**\n\n"
+        f"🔗 {link}\n\n"
+        f"📌 هر دعوت موفق = ۱ دانلود هدیه"
+    )
     
     keyboard = [
         [InlineKeyboardButton("📤 اشتراک‌گذاری", url=f"tg://msg?text={link}")],
@@ -187,16 +352,17 @@ async def referral_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
-# ======================== خرید اشتراک ========================
-async def buy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
-    text = f"♾ **اشتراک مادام‌العمر**\n\n"
-    text += f"با خرید اشتراک، بدون محدودیت دانلود کنید.\n\n"
-    text += f"💰 قیمت: {PREMIUM_PRICE}\n\n"
-    text += f"📞 برای خرید با پشتیبانی تماس بگیرید:\n"
-    text += f"@{SUPPORT_ID}"
+    text = (
+        f"♾ **اشتراک مادام‌العمر**\n\n"
+        f"با خرید اشتراک، بدون محدودیت دانلود کنید.\n\n"
+        f"💰 قیمت: {PREMIUM_PRICE}\n\n"
+        f"📞 برای خرید با پشتیبانی تماس بگیرید:\n"
+        f"@{SUPPORT_ID}"
+    )
     
     keyboard = [
         [InlineKeyboardButton("📞 ارتباط با پشتیبانی", url=f"https://t.me/{SUPPORT_ID}")],
@@ -205,147 +371,94 @@ async def buy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
-# ======================== تابع تایم‌اوت ========================
-async def timeout_task(msg_id: int, user_id: int, bot):
-    """بعد از ۲ دقیقه تایم‌اوت"""
-    await asyncio.sleep(120)
+# ======================== Admin Handlers ========================
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("❌ دسترسی ندارید!")
+        return
     
-    if msg_id in pending_requests:
-        del pending_requests[msg_id]
-        try:
-            await bot.send_message(user_id, "⏰ زمان دانلود تمام شد. دوباره تلاش کنید.")
-            await bot.delete_message(GROUP_ID, msg_id)
-        except:
-            pass
+    keyboard = [
+        [InlineKeyboardButton("📊 آمار کلی", callback_data="admin_stats")],
+        [InlineKeyboardButton("👑 مدیریت پریمیوم", callback_data="admin_premium")],
+        [InlineKeyboardButton("📋 لیست کاربران", callback_data="admin_users")],
+        [InlineKeyboardButton("🔙 بستن", callback_data="admin_close")]
+    ]
+    
+    await update.message.reply_text("🔧 **پنل مدیریت**", reply_markup=InlineKeyboardMarkup(keyboard))
 
-# ======================== هندلر لینک با فوروارد ========================
-async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    message = update.message
-    link = message.text
+async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
     
-    # 1️⃣ عضویت اجباری
-    for ch in SPONSOR_CHANNELS:
-        try:
-            member = await context.bot.get_chat_member(ch["id"], user_id)
-            if member.status in ["left", "kicked"]:
-                keyboard = [[InlineKeyboardButton(f"📢 عضویت در {ch['name']}", url=f"https://t.me/{ch['id'].replace('-100', '')}")]]
-                await message.reply_text(
-                    f"🚨 لطفاً در {ch['name']} عضو شوید",
-                    reply_markup=InlineKeyboardMarkup(keyboard)
-                )
-                return
-        except:
-            pass
+    total = len(users)
+    premium = sum(1 for u in users.values() if u.get("premium", False))
     
-    # 2️⃣ محدودیت دانلود
-    can, msg, _ = can_download(user_id)
-    if not can:
-        keyboard = [
-            [InlineKeyboardButton("🎁 دعوت از دوستان", callback_data="referral")],
-            [InlineKeyboardButton("♾️ خرید اشتراک", callback_data="buy")]
-        ]
-        await message.reply_text(
-            f"{msg}\n\nیکی از گزینه‌ها رو انتخاب کن:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        return
+    text = (
+        f"📊 **آمار کلی**\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"👥 کل کاربران: {total}\n"
+        f"👑 پریمیوم: {premium}\n"
+    )
     
-    # 3️⃣ ارسال به گروه (با کلمه کلیدی)
-    wait_msg = await message.reply_text("⏳ در حال پردازش...")
-    try:
-        # 🔥 ارسال با کلمه کلیدی /dl
-        group_msg = await context.bot.send_message(
-            GROUP_ID,
-            f"/dl {link}"
-        )
-        
-        # ذخیره برای matching
-        pending_requests[group_msg.message_id] = {
-            "user_id": user_id,
-            "time": time.time()
-        }
-        
-        # 🔥 تایمر با asyncio.create_task
-        asyncio.create_task(timeout_task(group_msg.message_id, user_id, context.bot))
-        
-        await wait_msg.delete()
-    except Exception as e:
-        await wait_msg.edit_text(f"❌ خطا: {str(e)[:50]}")
+    keyboard = [[InlineKeyboardButton("🔙 برگشت", callback_data="admin_back")]]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
-# ======================== گوش دادن به گروه ========================
-async def handle_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
+async def admin_premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
     
-    # فقط از دانلودر
-    if message.from_user.id != DOWNLOADER_ID:
-        return
+    text = (
+        f"👑 **مدیریت پریمیوم**\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"📋 دستور: /premium [user_id] on/off\n"
+        f"💡 مثال: /premium 123456789 on"
+    )
     
-    if not message.reply_to_message:
-        return
-    
-    msg_id = message.reply_to_message.message_id
-    
-    if msg_id not in pending_requests:
-        return
-    
-    user_id = pending_requests[msg_id]["user_id"]
-    del pending_requests[msg_id]
-    
-    # خطا؟
-    if message.text and ("error" in message.text.lower() or "❌" in message.text):
-        await context.bot.send_message(user_id, f"❌ خطا: {message.text}")
-        await cleanup(context, msg_id, message.message_id)
-        return
-    
-    # ثبت دانلود
-    increment_download(user_id)
-    
-    # ارسال فایل با کپشن ثابت
-    try:
-        if message.video:
-            await context.bot.send_video(user_id, message.video.file_id, caption=CUSTOM_CAPTION)
-        elif message.photo:
-            await context.bot.send_photo(user_id, message.photo[-1].file_id, caption=CUSTOM_CAPTION)
-        elif message.document:
-            await context.bot.send_document(user_id, message.document.file_id, caption=CUSTOM_CAPTION)
-        elif message.audio:
-            await context.bot.send_audio(user_id, message.audio.file_id, caption=CUSTOM_CAPTION)
-        elif message.voice:
-            await context.bot.send_voice(user_id, message.voice.file_id)
-        elif message.animation:
-            await context.bot.send_animation(user_id, message.animation.file_id, caption=CUSTOM_CAPTION)
-        else:
-            await context.bot.send_message(user_id, "⚠️ فرمت فایل پشتیبانی نمی‌شود")
-            await cleanup(context, msg_id, message.message_id)
-            return
-    except Exception as e:
-        await context.bot.send_message(user_id, f"❌ خطا: {str(e)[:50]}")
-    
-    await cleanup(context, msg_id, message.message_id)
+    keyboard = [[InlineKeyboardButton("🔙 برگشت", callback_data="admin_back")]]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
-# ======================== پاک‌سازی ========================
-async def cleanup(context, link_id, reply_id):
-    try:
-        await context.bot.delete_message(GROUP_ID, link_id)
-        await context.bot.delete_message(GROUP_ID, reply_id)
-    except:
-        pass
+async def admin_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    total = len(users)
+    text = f"📋 **لیست کاربران**\n━━━━━━━━━━━━━━━\n👥 کل: {total}\n━━━━━━━━━━━━━━━\n"
+    
+    for i, (uid, data) in enumerate(list(users.items())[-10:], 1):
+        premium = "👑" if data.get("premium", False) else "🆓"
+        downloads = data.get("downloads", 0)
+        text += f"{i}. `{uid}` {premium} - دانلود: {downloads}\n"
+    
+    keyboard = [[InlineKeyboardButton("🔙 برگشت", callback_data="admin_back")]]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
-# ======================== دستورات ادمین ========================
-async def premium_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id != ADMIN_ID:
+async def admin_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await admin_panel(update, context)
+
+async def admin_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("🔐 پنل بسته شد.")
+
+async def premium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("❌ دسترسی ندارید!")
         return
     
     parts = update.message.text.split()
-    if len(parts) < 2:
+    if len(parts) < 3:
         await update.message.reply_text("❌ /premium [user_id] on/off")
         return
     
-    target = int(parts[1])
-    status = parts[2].lower() if len(parts) > 2 else "on"
+    try:
+        target = int(parts[1])
+        status = parts[2].lower()
+    except:
+        await update.message.reply_text("❌ فرمت نامعتبر!")
+        return
+    
     user = get_user(target)
     user["premium"] = (status == "on")
     
@@ -359,63 +472,60 @@ async def premium_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(f"✅ کاربر {target} {'فعال' if user['premium'] else 'غیرفعال'} شد.")
 
-async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id != ADMIN_ID:
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("❌ دسترسی ندارید!")
         return
     
     total = len(users)
     premium = sum(1 for u in users.values() if u.get("premium", False))
     
-    text = f"📊 **آمار کلی**\n"
-    text += f"━━━━━━━━━━━━━━━\n"
-    text += f"👥 کل کاربران: {total}\n"
-    text += f"👑 پریمیوم: {premium}\n"
-    text += f"📅 تاریخ: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    text = (
+        f"📊 **آمار کلی**\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"👥 کل کاربران: {total}\n"
+        f"👑 پریمیوم: {premium}\n"
+    )
     
     await update.message.reply_text(text)
 
-async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id != ADMIN_ID:
-        await update.message.reply_text("❌ دسترسی ندارید!")
-        return
-    
-    global users
-    users = {}
-    await update.message.reply_text("🧹 **همه داده‌ها پاک شد!**")
-
-# ======================== اصلی ========================
-def main():
-    logging.basicConfig(level=logging.INFO)
-    
-    # وب‌سرور Flask
+# ======================== Main ========================
+async def main():
+    # Start Flask
     web_thread = Thread(target=run_web_server, daemon=True)
     web_thread.start()
-    print("✅ وب‌سرور Flask روشن شد")
+    logger.info("✅ Flask started")
     
-    # ربات
-    app = Application.builder().token(TOKEN).build()
+    # Set bot for telethon
+    telethon.bot = app.bot
     
-    # دستورات
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("premium", premium_cmd))
-    app.add_handler(CommandHandler("stats", stats_cmd))
-    app.add_handler(CommandHandler("reset", reset_cmd))
+    # Start Telethon
+    await telethon.start()
     
-    # کالبک‌ها
-    app.add_handler(CallbackQueryHandler(main_menu, pattern="^main_menu$"))
-    app.add_handler(CallbackQueryHandler(status_cmd, pattern="^status$"))
-    app.add_handler(CallbackQueryHandler(referral_cmd, pattern="^referral$"))
-    app.add_handler(CallbackQueryHandler(buy_cmd, pattern="^buy$"))
-    
-    # پیام‌ها
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
-    app.add_handler(MessageHandler(filters.StatusUpdate.ALL, handle_group))
-    
-    print("🤖 ربات دانلودر روشن شد...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Start bot polling
+    logger.info("🤖 Bot started!")
+    await app.run_polling()
 
 if __name__ == "__main__":
-    main()
+    # Create application
+    app = Application.builder().token(TOKEN).build()
+    
+    # Register handlers
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("admin", admin_panel))
+    app.add_handler(CommandHandler("premium", premium_command))
+    app.add_handler(CommandHandler("stats", stats_command))
+    
+    app.add_handler(CallbackQueryHandler(main_menu_callback, pattern="^main_menu$"))
+    app.add_handler(CallbackQueryHandler(status_callback, pattern="^status$"))
+    app.add_handler(CallbackQueryHandler(referral_callback, pattern="^referral$"))
+    app.add_handler(CallbackQueryHandler(buy_callback, pattern="^buy$"))
+    app.add_handler(CallbackQueryHandler(admin_stats, pattern="^admin_stats$"))
+    app.add_handler(CallbackQueryHandler(admin_premium, pattern="^admin_premium$"))
+    app.add_handler(CallbackQueryHandler(admin_users, pattern="^admin_users$"))
+    app.add_handler(CallbackQueryHandler(admin_back, pattern="^admin_back$"))
+    app.add_handler(CallbackQueryHandler(admin_close, pattern="^admin_close$"))
+    
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
+    
+    asyncio.run(main())
