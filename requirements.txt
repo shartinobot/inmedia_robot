@@ -1,4 +1,4 @@
 python-telegram-bot==20.7
-telethon==1.36.0
-Flask==3.0.0
-python-dotenv==1.0.0
+pyrogram==2.0.106
+pycryptodome==3.19.0
+tgcrypto==1.2.5
